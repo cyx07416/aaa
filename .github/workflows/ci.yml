@@ -1,0 +1,83 @@
+name: CI
+
+# 触发条件：push 到 main 分支，以及所有 pull_request
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 最小权限：只读仓库内容，避免工作流拥有多余写权限
+permissions:
+  contents: read
+
+# 同一分支的新提交会取消上一次未完成的运行，节省 CI 资源
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Job 1：单元测试（Vitest）
+  unit-test:
+    name: 单元测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Node.js 24 并启用 npm 缓存
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm # 缓存 npm 全局缓存目录，key 由 package-lock.json 哈希生成
+
+      - name: 安装依赖
+        run: npm install
+
+      - name: 运行单元测试
+        run: npm test
+
+  # Job 2：端到端测试（Playwright）
+  e2e-test:
+    name: 端到端测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # 大模型密钥通过仓库 Secrets 注入，避免明文出现在代码与日志中
+    env:
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Node.js 24 并启用 npm 缓存
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: 安装依赖
+        run: npm install
+
+      - name: 安装 Playwright 浏览器及系统依赖
+        # 用例中使用了 test.use({ channel: 'chrome' })，ubuntu-latest 镜像已预装 Chrome；
+        # 若改为使用 Playwright 自带的 Chromium，需同时移除该行配置。
+        run: npx playwright install --with-deps chromium
+
+      - name: 启动服务并运行端到端测试
+        run: |
+          # 后端服务默认监听 3000 端口，后台启动并把日志写入文件
+          node src/server.js > /tmp/aiqa-server.log 2>&1 &
+          # 轮询等待服务就绪（最多 30 秒），避免测试与启动过程产生竞态
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000 > /dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          # 若服务最终仍未就绪，直接输出日志并失败，便于定位问题
+          if ! curl -sf http://localhost:3000 > /dev/null; then
+            echo "服务启动失败，日志如下："
+            cat /tmp/aiqa-server.log
+            exit 1
+          fi
+          npm run test:e2e
