@@ -1,0 +1,152 @@
+name: Docker 实测
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - package.json
+      - src/**
+      - public/**
+      - data/.gitkeep
+      - .github/workflows/docker-verify.yml
+
+permissions:
+  contents: read
+
+jobs:
+  docker-verify:
+    name: Docker 构建与容器实测
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 构建优化前镜像（node:24）
+        run: |
+          sed 's/^FROM node:24-alpine$/FROM node:24/' Dockerfile > /tmp/Dockerfile.before
+          docker build --progress=plain -f /tmp/Dockerfile.before -t aiqa:before .
+
+      - name: 首次构建优化后镜像（node:24-alpine）
+        shell: bash
+        run: |
+          set -o pipefail
+          start=$(date +%s)
+          docker build --progress=plain -t aiqa:after . | tee /tmp/docker-build-first.log
+          echo "FIRST_BUILD_SECONDS=$(($(date +%s)-start))" >> "$GITHUB_ENV"
+
+      - name: 仅修改源码并验证构建缓存
+        shell: bash
+        run: |
+          set -o pipefail
+          printf '\n// Docker 构建缓存验证\n' >> src/server.js
+          start=$(date +%s)
+          docker build --progress=plain -t aiqa:after . | tee /tmp/docker-build-second.log
+          echo "SECOND_BUILD_SECONDS=$(($(date +%s)-start))" >> "$GITHUB_ENV"
+          grep -E 'CACHED|COPY.*(package.json|src|public|data)' /tmp/docker-build-second.log || true
+
+      - name: 测量镜像体积
+        run: |
+          before=$(docker image inspect aiqa:before --format '{{.Size}}')
+          after=$(docker image inspect aiqa:after --format '{{.Size}}')
+          before_mb=$(awk -v b="$before" 'BEGIN { printf "%.1f", b/1000000 }')
+          after_mb=$(awk -v b="$after" 'BEGIN { printf "%.1f", b/1000000 }')
+          saved_mb=$(awk -v b="$before" -v a="$after" 'BEGIN { printf "%.1f", (b-a)/1000000 }')
+          {
+            echo "优化前镜像（node:24）：${before_mb} MB（${before} bytes）"
+            echo "优化后镜像（node:24-alpine）：${after_mb} MB（${after} bytes）"
+            echo "镜像体积减少：${saved_mb} MB"
+            echo "首次构建耗时：${FIRST_BUILD_SECONDS}s；仅修改源码后重建耗时：${SECOND_BUILD_SECONDS}s"
+          } > /tmp/docker-report.txt
+          docker images aiqa --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'
+          cat /tmp/docker-report.txt
+
+      - name: 后台启动容器并检查端口及非 root 用户
+        run: |
+          docker run -d --name aiqa -p 3000:3000 -e DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" aiqa:after
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000 > /dev/null; then break; fi
+            sleep 1
+          done
+          curl -sf http://localhost:3000 > /dev/null
+          runtime_user=$(docker exec aiqa whoami)
+          test "$runtime_user" = "node"
+          container_status=$(docker ps --filter name=aiqa --format '{{.Status}} | {{.Ports}}')
+          {
+            echo "容器运行用户：${runtime_user}"
+            echo "容器状态与端口：${container_status}"
+          } >> /tmp/docker-report.txt
+          docker ps --filter name=aiqa
+          docker logs aiqa
+
+      - name: 准备浏览器验证环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: 安装测试依赖与浏览器
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: 在容器应用内真实提问并截图
+        run: |
+          node <<'NODE'
+          const { chromium } = require('@playwright/test');
+          const fs = require('node:fs');
+          (async () => {
+            const browser = await chromium.launch({ channel: 'chrome', headless: true });
+            const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+            await page.goto('http://localhost:3000');
+            const question = '请用一句话说明 Docker 容器的作用';
+            await page.locator('#question').fill(question);
+            const responsePromise = page.waitForResponse(response =>
+              response.url().includes('/api/ask') && response.request().method() === 'POST',
+              { timeout: 90000 }
+            );
+            await page.locator('#askBtn').click();
+            const response = await responsePromise;
+            if (response.status() !== 200) throw new Error(`提问接口返回 ${response.status()}`);
+            await page.locator('#askBtn').waitFor({ state: 'visible' });
+            await page.waitForFunction(() => {
+              const button = document.querySelector('#askBtn');
+              const answer = document.querySelector('#answer');
+              return button && !button.disabled && answer && answer.textContent.trim().length > 0;
+            }, undefined, { timeout: 90000 });
+            const answer = (await page.locator('#answer').textContent()).trim();
+            if (/^(错误：|网络异常：)/.test(answer)) throw new Error(answer);
+            await page.screenshot({ path: 'docker-ui.png', fullPage: true });
+            fs.writeFileSync('/tmp/ui-result.json', JSON.stringify({ status: response.status(), answerLength: answer.length }));
+            console.log(`容器页面提问成功：HTTP ${response.status()}，回答长度 ${answer.length}`);
+            await browser.close();
+          })().catch(error => { console.error(error); process.exit(1); });
+          NODE
+          node -e "const fs=require('node:fs');const r=JSON.parse(fs.readFileSync('/tmp/ui-result.json'));fs.appendFileSync('/tmp/docker-report.txt', '容器页面真实提问：HTTP '+r.status+'，回答非空（'+r.answerLength+' 字符）\n')"
+          cat /tmp/docker-report.txt
+
+      - name: 输出实测摘要与检查结果
+        if: always()
+        run: |
+          if [ -f /tmp/docker-report.txt ]; then
+            cat /tmp/docker-report.txt >> "$GITHUB_STEP_SUMMARY"
+            while IFS= read -r line; do
+              echo "::notice title=Docker 实测结果::${line}"
+            done < /tmp/docker-report.txt
+          fi
+
+      - name: 上传容器提问成功截图
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-ui-screenshot
+          path: docker-ui.png
+          retention-days: 7
+
+      - name: 清理容器
+        if: always()
+        run: docker rm -f aiqa || true

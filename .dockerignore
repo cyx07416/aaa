@@ -1,0 +1,12 @@
+node_modules/
+.git/
+.gitignore
+tests/
+test-results/
+playwright-report/
+blob-report/
+.github/
+.trae/
+.env
+.env.*
+*.log

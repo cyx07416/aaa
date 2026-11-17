@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
+    "start": "node src/server.js",
     "test": "vitest run --exclude tests/ask.e2e.spec.js",
     "test:api": "vitest run tests/ask.integration.test.js",
     "test:e2e": "playwright test tests/ask.e2e.spec.js"

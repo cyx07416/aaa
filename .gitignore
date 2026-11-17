@@ -2,7 +2,8 @@ node_modules/
 test-results/
 playwright-report/
 blob-report/
-data/
+data/*
+!data/.gitkeep
 .trae/
 .env
 .env.*
